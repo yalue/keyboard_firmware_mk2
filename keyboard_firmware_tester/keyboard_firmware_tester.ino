@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <Adafruit_NeoPixel.h>
+#include <bluefruit.h>
 #include "nrf.h"
 
 // Pin D5
@@ -9,6 +10,11 @@
 #define DEBOUNCE_MS (3)
 
 #define NUM_KEYS (9)
+
+// Can probably be 0. Making it something visible so I can debug the
+// idle logic. Should at least be DEBOUNCE_MS so we can stop bouncing
+// before sleeping (probably better to make it (DEBOUNCE_MS * 3)).
+#define MS_BEFORE_IDLE (DEBOUNCE_MS + 2000)
 
 // -- Create a NeoPixel object called onePixel that addresses 1 pixel in pin 8
 Adafruit_NeoPixel onePixel = Adafruit_NeoPixel(1, 8, NEO_GRB + NEO_KHZ800);
@@ -65,10 +71,14 @@ typedef struct {
   // 0 if key i is released, nonzero if pressed.
   int key_state[NUM_KEYS];
   // The time at which we expect key i to stop bouncing.
-  unsigned long debounce_done[NUM_KEYS];
+  uint32_t debounce_done[NUM_KEYS];
   // Updated with millis() at the start of each loop.
-  unsigned long current_ms;
+  uint32_t current_ms;
+  // The time at which a key was last released.
+  uint32_t last_release_ms;
+  int wakeup_isr_received;
   int blue_led_blink_counter;
+  int pressed_count;
 } GlobalState;
 
 // Current flows from columns to rows.
@@ -81,6 +91,24 @@ static constexpr uint8_t col_pins[3] = {17, 18, 19};
 
 GlobalState s;
 
+// We need to set an ISR in order for sd_app_evt_wait to trigger on our wakeup pin
+static void WakeISR(void) {
+  s.wakeup_isr_received = 1;
+}
+
+// Just turn on the red and blue LEDs and halt.
+static void ReportError(void) {
+  digitalWrite(3, HIGH);
+  digitalWrite(4, HIGH);
+  while (1) {
+    delay(5000);
+  }
+}
+
+static uint32_t CurrentMilliseconds(void) {
+  return ((uint64_t) millis()) & 0xffffffff;
+}
+
 void setup()  {
   int i;
   onePixel.begin();             // Start the NeoPixel object
@@ -88,6 +116,7 @@ void setup()  {
   onePixel.setBrightness(20);   // Affects all subsequent settings
   onePixel.show();              // Update the pixel state
   memset(&s, 0, sizeof(s));
+  Bluefruit.begin();
 
   //pinMode(4, OUTPUT);
   // Direction = output (1), disconnect input buffer = disconnected (1), all others 0
@@ -103,16 +132,26 @@ void setup()  {
   for (i = 0; i < 3; i++) {
     pinMode(row_pins[i], INPUT_PULLDOWN);
   }
+
+  // Set up for the wakeup circuit
+  pinMode(3, OUTPUT);
+  digitalWrite(3, LOW);
+  pinMode(WAKEUP_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(WAKEUP_PIN), WakeISR, CHANGE);
 }
 
 static void HandleKeyPressed(int key_index) {
+  s.pressed_count++;
   s.key_state[key_index] = 1;
   s.debounce_done[key_index] = s.current_ms + DEBOUNCE_MS;
 }
 
 static void HandleKeyReleased(int key_index) {
+  s.pressed_count--;
+  if (s.pressed_count < 0) ReportError();
   s.key_state[key_index] = 0;
   s.debounce_done[key_index] = s.current_ms + DEBOUNCE_MS;
+  s.last_release_ms = s.current_ms;
 }
 
 static void UpdateKeyState(int row, int col, int pressed) {
@@ -145,7 +184,7 @@ static void UpdateAllKeys(void) {
 // Updates s.current_ms, and handles wraparound if it occurred.
 static void UpdateTimer(void) {
   int i;
-  unsigned long new_ms = millis();
+  uint32_t new_ms = CurrentMilliseconds();
   if (new_ms < s.current_ms) {
     // Timer wraparound. Clear debounce counters to avoid being stuck forever.
     // Setting to 0 may lead to spurious presses, but only when the timer
@@ -153,6 +192,7 @@ static void UpdateTimer(void) {
     for (i = 0; i < NUM_KEYS; i++) {
       s.debounce_done[i] = 0;
     }
+    s.last_release_ms = new_ms;
   }
   s.current_ms = new_ms;
 }
@@ -161,10 +201,43 @@ static int IsKeyPressed(int row, int col) {
   return s.key_state[row * 3 + col];
 }
 
+// Returns true if and only if we actually slept and need to re-poll.
+static bool SleepIfIdle(void) {
+  int i;
+  // Never sleep if a key is pressed.
+  if (s.pressed_count != 0) return false;
+  // Don't sleep if a key was "recently" released. (for debugging, mostly)
+  if (s.current_ms < (s.last_release_ms + MS_BEFORE_IDLE)) return false;
+
+  digitalWrite(3, HIGH);  // For debugging; red LED
+
+  // Activate all columns so wakeup can be driven high
+  for (i = 0; i < 3; i++) {
+    digitalWrite(col_pins[i], HIGH);
+  }
+
+  // Actually sleep until we get the correct wakeup flag from the ISR
+  s.wakeup_isr_received = 0;
+  while (!s.wakeup_isr_received) {
+    sd_app_evt_wait();
+  }
+
+  // Deactivate all columns now that we've gotten the wakeup
+  for (i = 0; i < 3; i++) {
+    digitalWrite(col_pins[i], LOW);
+  }
+
+  digitalWrite(3, LOW);  // End the debug red LED
+
+  return true;
+}
+
 void loop()  {
   int i, j, rgb_color[3];
   UpdateTimer();
   UpdateAllKeys();
+  // Re-run the loop immediately if we actually slept.
+  if (SleepIfIdle()) return;
 
   // Test: LED RGB channel intensity determined by highest key pressed on each column.
   for (i = 0; i < 3; i++) {
